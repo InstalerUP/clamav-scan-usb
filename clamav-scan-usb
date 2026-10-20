@@ -1,0 +1,452 @@
+#!/bin/bash
+
+# ============================================================
+# ClamAV USB Scanner
+# Ubuntu Server
+# ============================================================
+
+MNT_POINT="/mnt/usb1"
+
+SCAN_PID=""
+MOUNTED_BY_SCRIPT=0
+SCAN_LOG=""
+SCAN_STATUS_FILE=""
+
+# ------------------------------------------------------------
+# 1. Проверка терминала и прав
+# ------------------------------------------------------------
+
+if [[ ! -t 0 || ! -t 1 ]]; then
+    echo "ОШИБКА: Требуется интерактивный терминал (TTY)." >&2
+    exit 1
+fi
+
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Запустите программу через sudo: sudo clamav-scan-usb" >&2
+    exit 1
+fi
+
+# ВАЖНО:
+# Если исходный терминал уже находится внутри флешки,
+# смена каталога в скрипте не изменит каталог родительского shell.
+case "$PWD" in
+    "$MNT_POINT"|"$MNT_POINT"/*)
+        echo "ОШИБКА: Ваш терминал находится внутри $MNT_POINT." >&2
+        echo "Сначала выполните в терминале: cd /" >&2
+        echo "Затем запустите скрипт повторно." >&2
+        exit 1
+        ;;
+esac
+
+# Скрипт работает из безопасного каталога.
+cd / || {
+    echo "ОШИБКА: Не удалось перейти в /." >&2
+    exit 1
+}
+
+# ------------------------------------------------------------
+# 2. Безопасное размонтирование
+# ------------------------------------------------------------
+
+safe_unmount() {
+    if (( MOUNTED_BY_SCRIPT == 0 )); then
+        return 0
+    fi
+
+    echo
+    echo "=== Размонтирование накопителя ==="
+
+    if ! mountpoint -q "$MNT_POINT"; then
+        echo "Точка монтирования уже свободна."
+        MOUNTED_BY_SCRIPT=0
+        return 0
+    fi
+
+    if umount "$MNT_POINT"; then
+        echo "УСПЕШНО: Накопитель размонтирован."
+        MOUNTED_BY_SCRIPT=0
+        return 0
+    fi
+
+    echo "ОШИБКА: Не удалось размонтировать накопитель." >&2
+    echo "Возможно, другой процесс использует флешку." >&2
+    echo "Проверка процессов:" >&2
+    fuser -vm "$MNT_POINT" 2>/dev/null || true
+    echo "Не извлекайте флешку, пока она смонтирована." >&2
+
+    return 1
+}
+
+# ------------------------------------------------------------
+# 3. Удаление временных файлов
+# ------------------------------------------------------------
+
+remove_temp_files() {
+    [[ -n "$SCAN_LOG" ]] && rm -f -- "$SCAN_LOG"
+    [[ -n "$SCAN_STATUS_FILE" ]] && rm -f -- "$SCAN_STATUS_FILE"
+}
+
+# ------------------------------------------------------------
+# 4. Обработчик Ctrl+C и SIGTERM
+# ------------------------------------------------------------
+
+cleanup() {
+    # Защита от повторного входа в обработчик.
+    trap '' INT TERM
+
+    echo
+    echo "============================================================"
+    echo "ПРЕРЫВАНИЕ: Получен сигнал остановки."
+    echo "============================================================"
+
+    # Останавливаем отдельную группу процессов сканирования.
+    if [[ -n "$SCAN_PID" ]]; then
+        echo "Останавливаем процессы сканирования..."
+
+        kill -TERM -- "-$SCAN_PID" 2>/dev/null || true
+
+        # Ждём завершения группы до 3 секунд.
+        for ((i = 0; i < 30; i++)); do
+            kill -0 -- "-$SCAN_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+
+        # Если процессы ещё работают, применяем SIGKILL.
+        if kill -0 -- "-$SCAN_PID" 2>/dev/null; then
+            kill -KILL -- "-$SCAN_PID" 2>/dev/null || true
+        fi
+
+        wait "$SCAN_PID" 2>/dev/null || true
+        SCAN_PID=""
+    fi
+
+    if safe_unmount; then
+        echo "Работа остановлена. Накопитель размонтирован."
+        remove_temp_files
+        exit 130
+    else
+        echo "ВНИМАНИЕ: Накопитель остался смонтированным." >&2
+        echo "Не извлекайте его до успешного размонтирования." >&2
+        echo "После устранения причины выполните:" >&2
+        echo "sudo umount $MNT_POINT" >&2
+        remove_temp_files
+        exit 1
+    fi
+}
+
+trap cleanup INT TERM
+
+# ------------------------------------------------------------
+# 5. Проверка необходимых команд
+# ------------------------------------------------------------
+
+for cmd in bash clamscan pv lsblk blkid mount umount \
+           mountpoint find findmnt setsid grep tee fuser \
+           mktemp readlink; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Не найдена команда: $cmd" >&2
+        echo "Проверьте установку необходимых пакетов." >&2
+        exit 1
+    fi
+done
+
+# Установка ClamAV, если он отсутствует.
+if ! command -v clamscan >/dev/null 2>&1; then
+    echo "Установка ClamAV..."
+    apt-get update -qq &&
+        apt-get install -y clamav || exit 1
+fi
+
+# Установка pv, если он отсутствует.
+if ! command -v pv >/dev/null 2>&1; then
+    echo "Установка pv..."
+    apt-get update -qq &&
+        apt-get install -y pv || exit 1
+fi
+
+# ------------------------------------------------------------
+# 6. Подготовка точки монтирования
+# ------------------------------------------------------------
+
+if [[ ! -d "$MNT_POINT" ]]; then
+    mkdir -p "$MNT_POINT" || {
+        echo "ОШИБКА: Не удалось создать $MNT_POINT." >&2
+        exit 1
+    }
+fi
+
+# Не размонтируем чужое устройство автоматически.
+if mountpoint -q "$MNT_POINT"; then
+    echo "ОШИБКА: $MNT_POINT уже является точкой монтирования." >&2
+    echo "Проверьте устройство перед продолжением." >&2
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# 7. Выбор раздела
+# ------------------------------------------------------------
+
+echo
+echo "=== ВЫБОР УСТРОЙСТВА ==="
+lsblk -o NAME,TYPE,FSTYPE,SIZE,MOUNTPOINT,LABEL
+echo
+
+read -r -p "Введите имя раздела (например, sdb1 или /dev/sdb1): " DEV_NAME
+
+# Убираем путь /dev/, если пользователь его указал.
+DEV_NAME="${DEV_NAME##*/}"
+
+# Проверяем формат имени.
+if [[ ! "$DEV_NAME" =~ ^[a-zA-Z0-9_.+-]+$ ]]; then
+    echo "ОШИБКА: Некорректное имя раздела." >&2
+    exit 1
+fi
+
+TARGET_DEV="/dev/$DEV_NAME"
+
+if [[ ! -b "$TARGET_DEV" ]]; then
+    echo "ОШИБКА: Устройство $TARGET_DEV не существует." >&2
+    exit 1
+fi
+
+DEV_TYPE=$(lsblk -dn -o TYPE "$TARGET_DEV" 2>/dev/null)
+
+if [[ "$DEV_TYPE" != "part" ]]; then
+    echo "ОШИБКА: Выберите раздел, а не диск целиком." >&2
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# 8. Защита системных разделов
+# ------------------------------------------------------------
+
+ROOT_SOURCE=$(findmnt -n -o SOURCE /)
+BOOT_SOURCE=$(findmnt -n -o SOURCE /boot 2>/dev/null || true)
+EFI_SOURCE=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || true)
+
+TARGET_REAL=$(readlink -f "$TARGET_DEV")
+ROOT_REAL=$(readlink -f "$ROOT_SOURCE" 2>/dev/null || true)
+BOOT_REAL=$(readlink -f "$BOOT_SOURCE" 2>/dev/null || true)
+EFI_REAL=$(readlink -f "$EFI_SOURCE" 2>/dev/null || true)
+
+if [[ "$TARGET_REAL" == "$ROOT_REAL" ||
+      "$TARGET_REAL" == "$BOOT_REAL" ||
+      "$TARGET_REAL" == "$EFI_REAL" ]]; then
+    echo "КРИТИЧЕСКАЯ ОШИБКА: Выбран системный раздел." >&2
+    exit 1
+fi
+
+# Запрещаем разделы, уже смонтированные в других местах.
+if lsblk -nr -o MOUNTPOINT "$TARGET_DEV" |
+        grep -q '[^[:space:]]'; then
+    echo "ОШИБКА: Раздел уже смонтирован." >&2
+    echo "Сначала безопасно размонтируйте его вручную." >&2
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# 9. Определение файловой системы
+# ------------------------------------------------------------
+
+echo
+echo "=== ОПРЕДЕЛЕНИЕ ФАЙЛОВОЙ СИСТЕМЫ ==="
+
+FSTYPE=$(blkid -o value -s TYPE "$TARGET_DEV" 2>/dev/null || true)
+
+if [[ -z "$FSTYPE" ]]; then
+    echo "ОШИБКА: Файловая система не определена." >&2
+    exit 1
+fi
+
+echo "Устройство: $TARGET_DEV"
+echo "Файловая система: $FSTYPE"
+
+case "$FSTYPE" in
+    vfat|exfat)
+        MOUNT_OPTS="ro,noexec,iocharset=utf8"
+        ;;
+    ntfs|ntfs3)
+        MOUNT_OPTS="ro,noexec"
+        ;;
+    *)
+        MOUNT_OPTS="ro,noexec"
+        ;;
+esac
+
+# ------------------------------------------------------------
+# 10. Монтирование
+# ------------------------------------------------------------
+
+echo
+echo "=== МОНТИРОВАНИЕ НАКОПИТЕЛЯ ==="
+
+if ! mount -o "$MOUNT_OPTS" "$TARGET_DEV" "$MNT_POINT"; then
+    echo "ОШИБКА: Не удалось смонтировать устройство." >&2
+    exit 1
+fi
+
+MOUNTED_BY_SCRIPT=1
+
+echo "Накопитель смонтирован только для чтения."
+echo "Точка монтирования: $MNT_POINT"
+
+# ------------------------------------------------------------
+# 11. Подсчёт файлов
+# ------------------------------------------------------------
+
+echo
+echo "=== ПОДСЧЁТ ФАЙЛОВ ==="
+
+TOTAL_FILES=$(find "$MNT_POINT" -type f -printf '.' 2>/dev/null | wc -c)
+COUNT_STATUS=$?
+
+if [[ ! "$TOTAL_FILES" =~ ^[0-9]+$ ]] || (( COUNT_STATUS != 0 )); then
+    echo "ОШИБКА: Не удалось подсчитать файлы." >&2
+    safe_unmount || true
+    exit 1
+fi
+
+echo "Всего файлов: $TOTAL_FILES"
+
+if (( TOTAL_FILES == 0 )); then
+    echo "Файлы для проверки не найдены."
+    safe_unmount || exit 1
+    echo "Работа завершена."
+    exit 0
+fi
+
+# ------------------------------------------------------------
+# 12. Подготовка сканирования
+# ------------------------------------------------------------
+
+SCAN_LOG=$(mktemp /tmp/clamav-usb-log.XXXXXX) || {
+    echo "ОШИБКА: Не удалось создать временный лог." >&2
+    safe_unmount || true
+    exit 1
+}
+
+SCAN_STATUS_FILE=$(mktemp /tmp/clamav-usb-status.XXXXXX) || {
+    echo "ОШИБКА: Не удалось создать файл статуса." >&2
+    safe_unmount || true
+    remove_temp_files
+    exit 1
+}
+
+# Начальное значение: 99 означает неизвестный статус.
+printf '99\n' > "$SCAN_STATUS_FILE"
+
+# ------------------------------------------------------------
+# 13. Сканирование
+# ------------------------------------------------------------
+
+echo
+echo "=== СКАНИРОВАНИЕ CLAMAV ==="
+echo "Для остановки нажмите Ctrl+C."
+echo
+
+# setsid запускает сканирование в отдельной группе процессов,
+# чтобы при прерывании можно было остановить весь конвейер.
+#
+# PIPESTATUS[0] сохраняет именно код завершения clamscan:
+# 0 — угроз не обнаружено;
+# 1 — обнаружены заражённые файлы;
+# 2 — техническая ошибка.
+
+setsid bash -c '
+    LOG_FILE="$1"
+    STATUS_FILE="$2"
+    MOUNT_DIR="$3"
+    TOTAL="$4"
+
+    set +e
+
+    clamscan -r --stdout "$MOUNT_DIR" 2>&1 |
+        tee "$LOG_FILE" |
+        grep --line-buffered -E "OK$|FOUND$|ERROR$|Infected files:" |
+        pv -l -s "$TOTAL" > /dev/null
+
+    CLAM_STATUS=${PIPESTATUS[0]}
+
+    printf "%s\n" "$CLAM_STATUS" > "$STATUS_FILE"
+
+    exit "$CLAM_STATUS"
+' _ "$SCAN_LOG" "$SCAN_STATUS_FILE" "$MNT_POINT" "$TOTAL_FILES" &
+
+SCAN_PID=$!
+
+wait "$SCAN_PID"
+PIPE_STATUS=$?
+SCAN_PID=""
+
+# Читаем код непосредственно от clamscan.
+SCAN_STATUS=$(cat "$SCAN_STATUS_FILE" 2>/dev/null || echo 99)
+
+if [[ ! "$SCAN_STATUS" =~ ^[0-9]+$ ]]; then
+    SCAN_STATUS=99
+fi
+
+echo
+echo "=== РЕЗУЛЬТАТ СКАНИРОВАНИЯ ==="
+
+case "$SCAN_STATUS" in
+    0)
+        echo "ClamAV не обнаружил заражённых файлов."
+        ;;
+    1)
+        echo "ВНИМАНИЕ: Обнаружены заражённые файлы!"
+        echo "Пути и результаты проверки сохранены во временном логе."
+        ;;
+    2)
+        echo "ОШИБКА: ClamAV сообщил о технической ошибке." >&2
+        ;;
+    *)
+        echo "ОШИБКА: Не удалось получить результат сканирования." >&2
+        echo "Код процесса: $PIPE_STATUS" >&2
+        ;;
+esac
+
+# ------------------------------------------------------------
+# 14. Размонтирование и завершение
+# ------------------------------------------------------------
+
+echo
+echo "=== ЗАВЕРШЕНИЕ РАБОТЫ ==="
+
+if ! safe_unmount; then
+    echo "Накопитель всё ещё смонтирован." >&2
+    echo "Не извлекайте флешку." >&2
+    echo "Лог проверки: $SCAN_LOG" >&2
+    echo "Статус проверки: $SCAN_STATUS" >&2
+    echo "Временные файлы сохранены для диагностики."
+    exit 1
+fi
+
+# Сохраняем краткую сводку перед удалением временного лога.
+if [[ -f "$SCAN_LOG" ]]; then
+    echo
+    echo "=== СВОДКА CLAMAV ==="
+    grep -E "Infected files:|Scanned files:|Errors:" "$SCAN_LOG" || true
+fi
+
+remove_temp_files
+
+case "$SCAN_STATUS" in
+    0)
+        echo
+        echo "ГОТОВО: Проверка завершена успешно."
+        echo "Флешку можно извлекать."
+        exit 0
+        ;;
+    1)
+        echo
+        echo "Проверка завершена: обнаружены угрозы."
+        echo "Флешку можно извлекать после размонтирования."
+        exit 1
+        ;;
+    *)
+        echo
+        echo "Проверка завершилась с технической ошибкой."
+        echo "Флешка размонтирована."
+        exit 2
+        ;;
+esac

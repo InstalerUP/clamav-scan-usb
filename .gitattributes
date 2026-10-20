@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+*.sh text eol=lf
+*.md text eol=lf
+clamav-scan-usb text eol=lf
+LICENSE text eol=lf
+.gitattributes text eol=lf
