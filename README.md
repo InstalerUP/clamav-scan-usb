@@ -29,22 +29,19 @@ Interactive scanning of USB drives using ClamAV.
 
 ## Установка
 
-Скачайте установщик и просмотрите его перед запуском:
+Скачайте интерактивный установщик:
 
 ```bash
-curl -fsSL \
-  https://raw.githubusercontent.com/InstalerUP/clamav-scan-usb/main/install.sh \
-  -o /tmp/clamav-scan-usb-install.sh \
-  && less /tmp/clamav-scan-usb-install.sh
+curl -fsSL https://raw.githubusercontent.com/InstalerUP/clamav-scan-usb/main/install.sh | sudo bash
 ```
 
-После просмотра запустите установщик:
+После установки можно проверить корректность скачивания:
 
 ```bash
-sudo bash /tmp/clamav-scan-usb-install.sh
+command -v clamav-scan-usb
 ```
 
-Установщик запросит подтверждение, проверит необходимые компоненты и установит программу.
+Ожидается получить ответ `/usr/local/bin/clamav-scan-usb`.
 
 ## Использование
 
@@ -58,38 +55,20 @@ sudo clamav-scan-usb
 
 ## Обновление
 
-Повторно скачайте установщик:
+Повторно скачайте интерактивный установщик:
 
 ```bash
-curl -fsSL \
-  https://raw.githubusercontent.com/InstalerUP/clamav-scan-usb/main/install.sh \
-  -o /tmp/clamav-scan-usb-install.sh \
-  && less /tmp/clamav-scan-usb-install.sh
-```
-
-После просмотра запустите его:
-
-```bash
-sudo bash /tmp/clamav-scan-usb-install.sh
+curl -fsSL https://raw.githubusercontent.com/InstalerUP/clamav-scan-usb/main/install.sh | sudo bash
 ```
 
 Установщик обнаружит существующую версию и предложит обновление. Перед заменой он сохранит резервную копию скрипта.
 
 ## Удаление
 
-Скачайте и просмотрите деинсталлятор:
+Скачайте интерактивный деинсталлятор:
 
 ```bash
-curl -fsSL \
-  https://raw.githubusercontent.com/InstalerUP/clamav-scan-usb/main/uninstall.sh \
-  -o /tmp/clamav-scan-usb-uninstall.sh \
-  && less /tmp/clamav-scan-usb-uninstall.sh
-```
-
-Запустите его:
-
-```bash
-sudo bash /tmp/clamav-scan-usb-uninstall.sh
+curl -fsSL https://raw.githubusercontent.com/InstalerUP/clamav-scan-usb/main/uninstall.sh | sudo bash
 ```
 
 Удаление требует подтверждения. Утилита и её установленная документация будут удалены. ClamAV, `pv` и резервные копии останутся в системе.
